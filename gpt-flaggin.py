@@ -1,7 +1,7 @@
 # gpt_flagging.py
 
 import os
-import openai
+from openai import OpenAI
 from datetime import datetime, timedelta
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -10,7 +10,7 @@ load_dotenv()
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-openai.api_key = os.environ["OPENAI_API_KEY"]
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -19,16 +19,22 @@ def get_recent_rows():
     since = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
     response = supabase.table("meta_ads_monitoring") \
         .select("id, business_name, spend, impressions, clicks, ctr, cpc, cpm, cpa, leads, purchases, conversions, date") \
-        .gte("date", since) \
         .order("date", desc=True).execute()
     rows = response.data or []
+    print(f"📦 Pulled {len(rows)} total rows from Supabase")
+
+    # Skipping date filtering temporarily — analyzing all rows for debugging
+    # rows = [r for r in rows if 'date' in r and datetime.fromisoformat(r['date'].replace("Z", "")) >= since_date]
+    filtered_rows = rows
+    print(f"✅ Retrieved {len(filtered_rows)} rows total before slicing")
+    rows = filtered_rows
 
     # Pre-flagging logic before GPT
     for row in rows:
         row["pre_flag"] = False
         row["pre_reason"] = None
         try:
-            date_obj = datetime.strptime(row["date"], "%Y-%m-%d")
+            date_obj = datetime.fromisoformat(row["date"].replace("Z", ""))
             days_old = (datetime.today() - date_obj).days
             if row["leads"] == 0 and days_old >= 2:
                 row["pre_flag"] = True
@@ -41,7 +47,7 @@ def get_recent_rows():
                 row["pre_reason"] = "High CPA"
         except:
             continue
-    return rows
+    return rows[:30]  # Slice here to ensure GPT gets only 30 rows
 
 # ========== FORMAT PROMPT ==========
 def build_prompt(rows):
@@ -77,7 +83,7 @@ Respond only with a valid JSON list and include a separate key called "top_5_sum
 
 # ========== CALL OPENAI ==========
 def get_ai_flags(prompt):
-    response = openai.ChatCompletion.create(
+    response = client.chat.completions.create(
         model="gpt-4",
         messages=[
             {"role": "system", "content": "You're a paid ads optimization assistant."},
@@ -86,7 +92,8 @@ def get_ai_flags(prompt):
         temperature=0.3,
     )
     text = response.choices[0].message.content
-    return eval(text)  # You could use json.loads with extra validation
+    import json
+    return json.loads(text)  # You could use json.loads with extra validation
 
 # ========== UPDATE SUPABASE ==========
 def update_rows(ai_results):
@@ -96,14 +103,14 @@ def update_rows(ai_results):
             "flagged_reason": row["reason"],
             "ai_summary": row["summary"]
         }
-        supabase.table("meta_ads_monitoring").update(updates) \
+        supabase.table("meta_ads_monitoring") \
+            .update(updates) \
             .eq("business_name", row["business_name"]) \
-            .eq("date", datetime.today().strftime("%Y-%m-%d")) \
             .execute()
 
 # ========== MAIN ==========
 def main():
-    rows = get_recent_rows()
+    rows = get_recent_rows()  # Limit to 30 rows to avoid GPT token overflow
     if not rows:
         print("No data to analyze.")
         return
