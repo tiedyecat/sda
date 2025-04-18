@@ -1,0 +1,5 @@
+aiohttp
+aiohttp-retry
+supabase
+nest_asyncio
+python-dotenv
