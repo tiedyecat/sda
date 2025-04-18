@@ -21,7 +21,7 @@ if not SUPABASE_URL or not SUPABASE_KEY or not OPENAI_API_KEY:
 # ──────── CONFIGURATION ────────
 MODEL_NAME = "gpt-4-0125-preview"
 BATCH_SIZE = 50
-CACHE_TTL = 600  # 10 minutes cache
+CACHE_TTL = 600  # 10 minutes
 
 # ──────── PAGE SETUP ────────
 st.set_page_config(
@@ -30,7 +30,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ──────── CLEAR CACHE BUTTON ────────
+# ──────── CLEAR CACHE BUTTON (for development) ────────
 st.sidebar.title("Developer Tools")
 if st.sidebar.button("Clear Cache"):
     st.cache_data.clear()
@@ -41,9 +41,13 @@ if st.sidebar.button("Clear Cache"):
 def fetch_and_clean_data() -> pd.DataFrame:
     """Fetch and clean all advertising data from Supabase."""
     try:
+        # Force clear cache during development to ensure fresh data
+        st.cache_data.clear()
+        
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
         select_columns = "date,business_name,leads,purchases,impressions,clicks,spend"
         
+        # CRITICAL FIX: NO DATE FILTER - fetch ALL data
         st.warning("TEST MODE: Fetching ALL data, date filter is currently disabled.")
         resp = sb.table("meta_ads_monitoring").select(select_columns).execute()
         
@@ -85,7 +89,6 @@ def generate_fitness_marketing_prompt(question: str, batch: pd.DataFrame) -> str
 
 You are an elite fitness marketing analyst with 15+ years experience optimizing ad campaigns for gyms and fitness centers. You're the industry's top consultant who specializes in rescuing struggling gyms from poor marketing performance. Gym owners pay you $10,000/month for your expertise because your recommendations consistently deliver results.
 
-## DATA PROVIDED
 
 ## ANALYSIS REQUEST
 "{question}"
@@ -144,39 +147,42 @@ def query_data_with_gpt(df: pd.DataFrame, question: str) -> str:
             st.error(f"Error during analysis: {str(e)}")
             return f"Analysis failed. Error: {str(e)}"
     
-    # For larger datasets, use batch processing and synthesis
+    # For larger datasets, use batch processing with spinners instead of progress bars
     all_responses = []
     total_rows = len(df)
     num_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
     
-    with st.progress(0) as progress_bar:
-        for i in range(0, total_rows, BATCH_SIZE):
-            batch_num = i // BATCH_SIZE + 1
-            batch = df.iloc[i:min(i + BATCH_SIZE, total_rows)]
+    # Use info message instead of progress bar to avoid errors
+    st.info(f"Processing {total_rows} rows in {num_batches} batches...")
+    
+    for i in range(0, total_rows, BATCH_SIZE):
+        batch_num = i // BATCH_SIZE + 1
+        batch = df.iloc[i:min(i + BATCH_SIZE, total_rows)]
+        
+        if batch.empty:
+            continue
             
-            if batch.empty:
-                continue
-                
-            prompt = generate_fitness_marketing_prompt(question, batch)
+        prompt = generate_fitness_marketing_prompt(question, batch)
+        
+        try:
+            progress_text = f"Analyzing batch {batch_num}/{num_batches} ({len(batch)} rows)..."
+            with st.spinner(progress_text):
+                response = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_tokens=1200
+                )
             
-            try:
-                progress_text = f"Analyzing batch {batch_num}/{num_batches} ({len(batch)} rows)..."
-                with st.spinner(progress_text):
-                    response = client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.2,
-                        max_tokens=1200
-                    )
-                
-                if response.choices and len(response.choices) > 0 and response.choices[0].message:
-                    all_responses.append(response.choices[0].message.content)
-                
-                progress_bar.progress(batch_num / num_batches)
+            if response.choices and len(response.choices) > 0 and response.choices[0].message:
+                all_responses.append(response.choices[0].message.content)
             
-            except Exception as e:
-                st.error(f"Error analyzing batch {batch_num}: {str(e)}")
-                return f"Analysis failed on batch {batch_num}. Error: {str(e)}"
+        except Exception as e:
+            st.error(f"Error analyzing batch {batch_num}: {str(e)}")
+            print(f"--- Full Traceback for Batch {batch_num} Error ---")
+            print(traceback.format_exc())
+            print("--- End Traceback ---")
+            return f"Analysis failed on batch {batch_num}. Error: {str(e)}"
     
     # Synthesize all responses with a final analysis
     if all_responses:
@@ -270,7 +276,7 @@ else:
                 end_time = time.time()
                 st.success(f"Analysis completed in {end_time - start_time:.2f} seconds.")
                 
-                # Display the expert analysis with full markdown formatting
+                # Display the expert analysis with markdown formatting
                 st.markdown("## 🏋️ Fitness Marketing Expert Analysis")
                 st.markdown(answer)
             else:
