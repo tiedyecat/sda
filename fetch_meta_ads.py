@@ -2,9 +2,9 @@ import os
 import aiohttp
 import asyncio
 import json
-import hashlib
 import uuid
-from datetime import datetime, timedelta
+import hashlib
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client, SupabaseException
 import nest_asyncio
@@ -13,12 +13,7 @@ from aiohttp_retry import RetryClient, ExponentialRetry
 load_dotenv()
 nest_asyncio.apply()
 
-# Custom exception for max retries
-class MaxRetriesExceededError(Exception):
-    """Raised when maximum number of retries is exceeded"""
-    pass
-
-# Function for deterministic UUID generation
+# ========== HELPER FUNCTIONS ==========
 def generate_deterministic_uuid(ad_id, date_str):
     """Generate a stable UUID from ad_id and date combination"""
     base = f"{ad_id}-{date_str}"
@@ -63,9 +58,7 @@ async def fetch_url(client, url, params, max_retries=5):
             print(f"❌ Error during fetch_url: {e}")
             retries += 1
             await asyncio.sleep(5 * retries)
-    
-    # Raise specific exception when max retries are reached
-    raise MaxRetriesExceededError(f"Max retries ({max_retries}) reached for Meta API call: {url}")
+    raise Exception("Max retries reached for Meta API call.")
 
 # ========== FETCH FUNCTIONS ==========
 async def fetch_ads(client, ad_account_id):
@@ -99,7 +92,7 @@ async def fetch_insights(client, ad_account_id, time_range):
     url = f"{BASE_URL}/act_{ad_account_id}/insights"
     params = {
         "access_token": ACCESS_TOKEN,
-        "fields": "date_start,date_stop,ad_id,impressions,clicks,ctr,spend,frequency,actions",
+        "fields": "date_start,date_stop,ad_id,impressions,clicks,ctr,spend,frequency,reach,actions",
         "level": "ad",
         "time_range[since]": time_range["since"],
         "time_range[until]": time_range["until"],
@@ -120,13 +113,93 @@ async def fetch_insights(client, ad_account_id, time_range):
         url = data.get("paging", {}).get("next")
         
         # Clear params for subsequent requests to avoid parameter duplication
-        # as the next URL already includes necessary parameters
         params = {}
         
         print(f"  📊 Fetched insights page {page_count} ({len(insights_page)} records)")
     
     print(f"  ✅ Total: {len(all_insights)} insight records across {page_count} pages")
     return {"data": all_insights}
+
+async def fetch_ad_creatives(client, ad_id):
+    """Fetch creative details for a specific ad"""
+    url = f"{BASE_URL}/{ad_id}/adcreatives"
+    params = {
+        "access_token": ACCESS_TOKEN,
+        "fields": "id,name,object_story_spec,thumbnail_url,asset_feed_spec,image_hash,object_type",
+        "limit": 10  # Typically one ad has few creatives
+    }
+    
+    creatives_data = await fetch_url(client, url, params)
+    return creatives_data.get("data", [])
+
+async def get_image_url_from_hash(client, ad_account_id, image_hash):
+    """Get the actual image URL from an image hash"""
+    if not image_hash:
+        return None
+        
+    url = f"{BASE_URL}/act_{ad_account_id}/adimages"
+    params = {
+        "access_token": ACCESS_TOKEN,
+        "hashes": json.dumps([image_hash])
+    }
+    
+    result = await fetch_url(client, url, params)
+    if result and "data" in result and len(result["data"]) > 0:
+        # The URL is nested in the response
+        return result["data"][0].get("url")
+    return None
+
+# ========== CREATIVE PROCESSING ==========
+def extract_creative_elements(creative):
+    """Extract text, descriptions, CTAs from creatives"""
+    elements = {
+        "creative_id": creative.get("id"),
+        "headline": None,
+        "description": None,
+        "cta_type": None,
+        "thumbnail_url": creative.get("thumbnail_url"),
+        "image_hash": None
+    }
+    
+    # Extract from object_story_spec based on type
+    object_story_spec = creative.get("object_story_spec", {})
+    
+    # Image ads
+    if "link_data" in object_story_spec:
+        link_data = object_story_spec["link_data"]
+        elements["headline"] = link_data.get("name")
+        elements["description"] = link_data.get("description") or link_data.get("message")
+        elements["image_hash"] = link_data.get("image_hash")
+        
+        # Extract CTA
+        if "call_to_action" in link_data:
+            elements["cta_type"] = link_data["call_to_action"].get("type")
+    
+    # Video ads        
+    elif "video_data" in object_story_spec:
+        video_data = object_story_spec["video_data"]
+        elements["headline"] = video_data.get("title")
+        elements["description"] = video_data.get("message")
+        
+        # Extract CTA
+        if "call_to_action" in video_data:
+            elements["cta_type"] = video_data["call_to_action"].get("type")
+    
+    # For dynamic creative ads
+    if "asset_feed_spec" in creative:
+        asset_feed = creative["asset_feed_spec"]
+        if "images" in asset_feed:
+            # Get first image hash
+            if asset_feed["images"] and len(asset_feed["images"]) > 0:
+                elements["image_hash"] = asset_feed["images"][0].get("hash")
+        
+        # Extract other elements from ad templates
+        if "ad_templates" in asset_feed and len(asset_feed["ad_templates"]) > 0:
+            template = asset_feed["ad_templates"][0]
+            elements["headline"] = template.get("title") or elements["headline"]
+            elements["description"] = template.get("body") or elements["description"]
+    
+    return elements
 
 # ========== PROCESS + SAVE ==========
 async def process_and_save(ad_account_id, time_range, business_name):
@@ -136,20 +209,48 @@ async def process_and_save(ad_account_id, time_range, business_name):
             insights = await fetch_insights(client, ad_account_id, time_range)
             ads = await fetch_ads(client, ad_account_id)
             campaigns = await fetch_campaigns(client, ad_account_id)
-        except MaxRetriesExceededError as retry_error:
-            print(f"⚠️ Skipping {business_name} after max retries: {retry_error}")
-            return
         except Exception as api_error:
             print(f"❌ API Fetch Error for {business_name}: {api_error}")
             return
 
         ad_map = {ad["id"]: ad for ad in ads}
         rows_to_insert = []
+        
+        # Creative cache to avoid redundant API calls
+        creative_cache = {}
 
         for insight in insights.get("data", []):
             try:
                 ad_id = insight.get("ad_id")
                 date_str = insight.get("date_start")
+                
+                # Fetch creative data for this ad (use cache if available)
+                if ad_id not in creative_cache:
+                    creatives = await fetch_ad_creatives(client, ad_id)
+                    creative_cache[ad_id] = creatives
+                else:
+                    creatives = creative_cache[ad_id]
+                
+                # Process creative elements (use first creative if multiple exist)
+                creative_elements = {}
+                if creatives and len(creatives) > 0:
+                    creative_elements = extract_creative_elements(creatives[0])
+                    
+                    # If we have an image hash, get the actual URL
+                    if creative_elements.get("image_hash"):
+                        # Check if we already got this image URL
+                        image_hash = creative_elements.get("image_hash")
+                        if f"img_{image_hash}" not in creative_cache:
+                            image_url = await get_image_url_from_hash(
+                                client, 
+                                ad_account_id, 
+                                image_hash
+                            )
+                            creative_cache[f"img_{image_hash}"] = image_url
+                        else:
+                            image_url = creative_cache[f"img_{image_hash}"]
+                            
+                        creative_elements["image_url"] = image_url
                 
                 ad_data = ad_map.get(ad_id, {})
                 ad_name = ad_data.get("name", "Unknown")
@@ -162,6 +263,7 @@ async def process_and_save(ad_account_id, time_range, business_name):
                 clicks = int(insight.get("clicks", 0))
                 spend = float(insight.get("spend", 0))
                 frequency = float(insight.get("frequency", 0))
+                reach = int(insight.get("reach", 0))  # Added reach metric
                 ctr = (clicks / impressions * 100) if impressions else 0
                 cpc = (spend / clicks) if clicks else 0
                 cpm = (spend / impressions * 1000) if impressions else 0
@@ -188,13 +290,25 @@ async def process_and_save(ad_account_id, time_range, business_name):
                     "cpc": cpc,
                     "cpm": cpm,
                     "frequency": frequency,
+                    "reach": reach,  # Added reach field
                     "conversions": conversions,
                     "leads": leads,
                     "purchases": purchases,
                     "cpa": cpa,
                     "date": date_str,
                     "flagged": False,
-                    "flagged_reason": None
+                    "flagged_reason": None,
+                    
+                    # Creative fields
+                    "creative_id": creative_elements.get("creative_id"),
+                    "headline": creative_elements.get("headline"),
+                    "description": creative_elements.get("description"),
+                    "cta_type": creative_elements.get("cta_type"),
+                    "thumbnail_url": creative_elements.get("thumbnail_url"),
+                    "image_url": creative_elements.get("image_url"),
+                    
+                    # Updated timestamp with timezone (fixed deprecation warning)
+                    "updated_at": datetime.now(timezone.utc).isoformat()
                 })
             except Exception as row_err:
                 print(f"⚠️ Error processing insight row for {business_name}: {row_err}")
@@ -204,21 +318,20 @@ async def process_and_save(ad_account_id, time_range, business_name):
             print(f"ℹ️ No rows to insert for {business_name}")
             return
 
-        # Improved error handling for Supabase operations
         try:
-            # Try to insert in smaller batches if there are many rows
+            # Process in batches for better error handling
             batch_size = 100
             for i in range(0, len(rows_to_insert), batch_size):
                 batch = rows_to_insert[i:i+batch_size]
                 try:
                     supabase.table("meta_ads_monitoring") \
-                        .upsert(batch, on_conflict=["id"]) \
-                        .execute()
+                            .upsert(batch, on_conflict=["id"]) \
+                            .execute()
                     print(f"✅ Inserted batch {i//batch_size + 1} ({len(batch)} rows) for {business_name}")
                 except Exception as batch_err:
                     print(f"❌ Error inserting batch {i//batch_size + 1} for {business_name}: {batch_err}")
                     
-                    # If specific PostgREST error, log more details
+                    # If specific PostgREST error, try individual row insertion
                     if hasattr(batch_err, 'code') and batch_err.code == 'PGRST100':
                         print(f"  PostgREST parsing error. Try checking data types and field names.")
                         
